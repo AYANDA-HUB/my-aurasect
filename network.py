@@ -1,4 +1,4 @@
-# Copyright (c) 2012, 2025, Oracle and/or its affiliates.
+# Copyright (c) 2023, 2024, Oracle and/or its affiliates.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License, version 2.0, as
@@ -26,18 +26,16 @@
 # along with this program; if not, write to the Free Software Foundation, Inc.,
 # 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
 
+# pylint: disable=dangerous-default-value
+
 """Module implementing low-level socket communication with MySQL servers."""
 
-# pylint: disable=overlapping-except
 
-import socket
+__all__ = ["MySQLTcpSocket", "MySQLUnixSocket"]
+
+import asyncio
 import struct
-import warnings
 import zlib
-
-from abc import ABC, abstractmethod
-from collections import deque
-from typing import Any, Deque, List, Optional, Tuple, Union
 
 try:
     import ssl
@@ -48,14 +46,14 @@ try:
         "TLSv1.2": ssl.PROTOCOL_TLSv1_2,
         "TLSv1.3": ssl.PROTOCOL_TLS,
     }
-    TLS_V1_3_SUPPORTED = hasattr(ssl, "HAS_TLSv1_3") and ssl.HAS_TLSv1_3
 except ImportError:
-    # If import fails, we don't have SSL support.
-    TLS_V1_3_SUPPORTED = False
     ssl = None
 
-from .errors import (
-    ConnectionTimeoutError,
+from abc import ABC, abstractmethod
+from collections import deque
+from typing import Any, Deque, List, Optional, Tuple
+
+from ..errors import (
     InterfaceError,
     NotSupportedError,
     OperationalError,
@@ -63,11 +61,13 @@ from .errors import (
     ReadTimeoutError,
     WriteTimeoutError,
 )
-
-MIN_COMPRESS_LENGTH = 50
-MAX_PAYLOAD_LENGTH = 2**24 - 1
-PACKET_HEADER_LENGTH = 4
-COMPRESSED_PACKET_HEADER_LENGTH = 7
+from ..network import (
+    COMPRESSED_PACKET_HEADER_LENGTH,
+    MAX_PAYLOAD_LENGTH,
+    MIN_COMPRESS_LENGTH,
+    PACKET_HEADER_LENGTH,
+)
+from .utils import StreamWriter, open_connection
 
 
 def _strioerror(err: IOError) -> str:
@@ -75,7 +75,7 @@ def _strioerror(err: IOError) -> str:
 
     This function reformats the IOError error message.
     """
-    return str(err) if not err.errno else f"Errno {err.errno}: {err.strerror}"
+    return str(err) if not err.errno else f"{err.errno} {err.strerror}"
 
 
 class NetworkBroker(ABC):
@@ -103,13 +103,14 @@ class NetworkBroker(ABC):
     """
 
     @abstractmethod
-    def send(
+    async def write(
         self,
-        sock: socket.socket,
+        writer: StreamWriter,
         address: str,
         payload: bytes,
         packet_number: Optional[int] = None,
         compressed_packet_number: Optional[int] = None,
+        write_timeout: Optional[int] = None,
     ) -> None:
         """Send `payload` to the MySQL server.
 
@@ -124,6 +125,9 @@ class NetworkBroker(ABC):
                            plain packets.
             compressed_packet_number: Same as `packet_number` but used when sending
                                       compressed packets.
+            write_timeout: Timeout in seconds before which sending a packet to the server
+                           should finish else WriteTimeoutError is raised.
+
 
         Raises:
             :class:`OperationalError`: If something goes wrong while sending packets to
@@ -131,12 +135,19 @@ class NetworkBroker(ABC):
         """
 
     @abstractmethod
-    def recv(self, sock: socket.socket, address: str) -> bytearray:
+    async def read(
+        self,
+        reader: asyncio.StreamReader,
+        address: str,
+        read_timeout: Optional[int] = None,
+    ) -> bytearray:
         """Get the next available packet from the MySQL server.
 
         Args:
             sock: Object holding the socket connection.
             address: Socket's location.
+            read_timeout: Timeout in seconds before which reading a packet from the server
+                          should finish.
 
         Returns:
             packet: A packet from the MySQL server.
@@ -144,6 +155,8 @@ class NetworkBroker(ABC):
         Raises:
             :class:`OperationalError`: If something goes wrong while receiving packets
                                        from the MySQL server.
+            :class:`ReadTimeoutError`: If the time to receive a packet from the server takes
+                                       longer than `read_timeout`.
             :class:`InterfaceError`: If something goes wrong while receiving packets
                                      from the MySQL server.
         """
@@ -155,16 +168,37 @@ class NetworkBrokerPlain(NetworkBroker):
     def __init__(self) -> None:
         self._pktnr: int = -1  # packet number
 
-    def _set_next_pktnr(self) -> None:
-        """Increment packet id."""
-        self._pktnr = (self._pktnr + 1) % 256
+    @staticmethod
+    def get_header(pkt: bytes) -> Tuple[int, int]:
+        """Recover the header information from a packet."""
+        if len(pkt) < PACKET_HEADER_LENGTH:
+            raise ValueError("Can't recover header info from an incomplete packet")
 
-    def _send_pkt(self, sock: socket.socket, address: str, pkt: bytes) -> None:
+        pll, seqid = (
+            struct.unpack("<I", pkt[0:3] + b"\x00")[0],
+            pkt[3],
+        )
+        # payload length, sequence id
+        return pll, seqid
+
+    def _set_next_pktnr(self, next_id: Optional[int] = None) -> None:
+        """Set the given packet id, if any, else increment packet id."""
+        if next_id is None:
+            self._pktnr += 1
+        else:
+            self._pktnr = next_id
+        self._pktnr %= 256
+
+    async def _write_pkt(
+        self,
+        writer: StreamWriter,
+        address: str,
+        pkt: bytes,
+    ) -> None:
         """Write packet to the comm channel."""
         try:
-            sock.sendall(pkt)
-        except (socket.timeout, TimeoutError) as err:
-            raise WriteTimeoutError(errno=3024) from err
+            writer.write(pkt)
+            await writer.drain()
         except IOError as err:
             raise OperationalError(
                 errno=2055, values=(address, _strioerror(err))
@@ -172,78 +206,93 @@ class NetworkBrokerPlain(NetworkBroker):
         except AttributeError as err:
             raise OperationalError(errno=2006) from err
 
-    def _recv_chunk(self, sock: socket.socket, size: int = 0) -> bytearray:
-        """Read `size` bytes from the comm channel."""
-        pkt = bytearray(size)
-        pkt_view = memoryview(pkt)
-        while size:
-            read = sock.recv_into(pkt_view, size)
-            if read == 0 and size > 0:
-                raise InterfaceError(errno=2013)
-            pkt_view = pkt_view[read:]
-            size -= read
-        return pkt
-
-    def send(
+    async def _read_chunk(
         self,
-        sock: socket.socket,
+        reader: asyncio.StreamReader,
+        size: int = 0,
+        read_timeout: Optional[int] = None,
+    ) -> bytearray:
+        """Read `size` bytes from the comm channel."""
+        try:
+            pkt = bytearray(b"")
+            while len(pkt) < size:
+                chunk = await asyncio.wait_for(
+                    reader.read(size - len(pkt)), read_timeout
+                )
+                if not chunk:
+                    raise InterfaceError(errno=2013)
+                pkt += chunk
+            return pkt
+        except asyncio.TimeoutError as err:
+            raise ReadTimeoutError(errno=3024) from err
+        except asyncio.CancelledError as err:
+            raise err
+
+    async def write(
+        self,
+        writer: StreamWriter,
         address: str,
         payload: bytes,
         packet_number: Optional[int] = None,
         compressed_packet_number: Optional[int] = None,
+        write_timeout: Optional[int] = None,
     ) -> None:
         """Send payload to the MySQL server.
 
         If provided a payload whose length is greater than `MAX_PAYLOAD_LENGTH`, it is
         broken down into packets.
         """
-        if packet_number is None:
-            self._set_next_pktnr()
-        else:
-            self._pktnr = packet_number
-
-        # If the payload is larger than or equal to MAX_PAYLOAD_LENGTH
-        # the length is set to 2^24 - 1 (ff ff ff) and additional
-        # packets are sent with the rest of the payload until the
-        # payload of a packet is less than MAX_PAYLOAD_LENGTH.
-        if len(payload) >= MAX_PAYLOAD_LENGTH:
-            offset = 0
+        self._set_next_pktnr(packet_number)
+        # If the payload is larger than or equal to MAX_PAYLOAD_LENGTH the length is
+        # set to 2^24 - 1 (ff ff ff) and additional packets are sent with the rest of
+        # the payload until the payload of a packet is less than MAX_PAYLOAD_LENGTH.
+        offset = 0
+        try:
             for _ in range(len(payload) // MAX_PAYLOAD_LENGTH):
                 # payload_len, sequence_id, payload
-                self._send_pkt(
-                    sock,
-                    address,
-                    b"\xff\xff\xff"
-                    + struct.pack("<B", self._pktnr)
-                    + payload[offset : offset + MAX_PAYLOAD_LENGTH],
+                await asyncio.wait_for(
+                    self._write_pkt(
+                        writer,
+                        address,
+                        b"\xff" * 3
+                        + struct.pack("<B", self._pktnr)
+                        + payload[offset : offset + MAX_PAYLOAD_LENGTH],
+                    ),
+                    write_timeout,
                 )
                 self._set_next_pktnr()
                 offset += MAX_PAYLOAD_LENGTH
-            payload = payload[offset:]
-        self._send_pkt(
-            sock,
-            address,
-            struct.pack("<I", len(payload))[0:3]
-            + struct.pack("<B", self._pktnr)
-            + payload,
-        )
+            await asyncio.wait_for(
+                self._write_pkt(
+                    writer,
+                    address,
+                    struct.pack("<I", len(payload) - offset)[0:3]
+                    + struct.pack("<B", self._pktnr)
+                    + payload[offset:],
+                ),
+                write_timeout,
+            )
+        except asyncio.TimeoutError as err:
+            raise WriteTimeoutError(errno=3024) from err
+        except asyncio.CancelledError as err:
+            raise err
 
-    def recv(self, sock: socket.socket, address: str) -> bytearray:
+    async def read(
+        self,
+        reader: asyncio.StreamReader,
+        address: str,
+        read_timeout: Optional[int] = None,
+    ) -> bytearray:
         """Receive `one` packet from the MySQL server."""
         try:
-            # Read the header of the MySQL packet
-            header = self._recv_chunk(sock, size=PACKET_HEADER_LENGTH)
+            # Read the header of the MySQL packet.
+            header = await self._read_chunk(reader, PACKET_HEADER_LENGTH, read_timeout)
 
-            # Pull the payload length and sequence id
-            payload_len, self._pktnr = (
-                struct.unpack("<I", header[0:3] + b"\x00")[0],
-                header[3],
-            )
+            # Pull the payload length and sequence id.
+            payload_len, self._pktnr = self.get_header(header)
 
-            # Read the payload, and return packet
-            return header + self._recv_chunk(sock, size=payload_len)
-        except (socket.timeout, TimeoutError) as err:
-            raise ReadTimeoutError(errno=3024, msg=err.strerror) from err
+            # Read the payload, and return packet.
+            return header + await self._read_chunk(reader, payload_len, read_timeout)
         except IOError as err:
             raise OperationalError(
                 errno=2055, values=(address, _strioerror(err))
@@ -261,34 +310,56 @@ class NetworkBrokerCompressed(NetworkBrokerPlain):
     @staticmethod
     def _prepare_packets(payload: bytes, pktnr: int) -> List[bytes]:
         """Prepare a payload for sending to the MySQL server."""
+        offset = 0
         pkts = []
 
-        # If the payload is larger than or equal to MAX_PAYLOAD_LENGTH
-        # the length is set to 2^24 - 1 (ff ff ff) and additional
-        # packets are sent with the rest of the payload until the
-        # payload of a packet is less than MAX_PAYLOAD_LENGTH.
-        if len(payload) >= MAX_PAYLOAD_LENGTH:
-            offset = 0
-            for _ in range(len(payload) // MAX_PAYLOAD_LENGTH):
-                # payload length + sequence id + payload
-                pkts.append(
-                    b"\xff\xff\xff"
-                    + struct.pack("<B", pktnr)
-                    + payload[offset : offset + MAX_PAYLOAD_LENGTH]
-                )
-                pktnr = (pktnr + 1) % 256
-                offset += MAX_PAYLOAD_LENGTH
-            payload = payload[offset:]
+        # If the payload is larger than or equal to MAX_PAYLOAD_LENGTH the length is
+        # set to 2^24 - 1 (ff ff ff) and additional packets are sent with the rest of
+        # the payload until the payload of a packet is less than MAX_PAYLOAD_LENGTH.
+        for _ in range(len(payload) // MAX_PAYLOAD_LENGTH):
+            # payload length + sequence id + payload
+            pkts.append(
+                b"\xff" * 3
+                + struct.pack("<B", pktnr)
+                + payload[offset : offset + MAX_PAYLOAD_LENGTH]
+            )
+            pktnr = (pktnr + 1) % 256
+            offset += MAX_PAYLOAD_LENGTH
         pkts.append(
-            struct.pack("<I", len(payload))[0:3] + struct.pack("<B", pktnr) + payload
+            struct.pack("<I", len(payload) - offset)[0:3]
+            + struct.pack("<B", pktnr)
+            + payload[offset:]
         )
         return pkts
 
-    def _set_next_compressed_pktnr(self) -> None:
-        """Increment packet id."""
-        self._compressed_pktnr = (self._compressed_pktnr + 1) % 256
+    @staticmethod
+    def get_header(pkt: bytes) -> Tuple[int, int, int]:  # type: ignore[override]
+        """Recover the header information from a packet."""
+        if len(pkt) < COMPRESSED_PACKET_HEADER_LENGTH:
+            raise ValueError("Can't recover header info from an incomplete packet")
 
-    def _send_pkt(self, sock: socket.socket, address: str, pkt: bytes) -> None:
+        compressed_pll, seqid, uncompressed_pll = (
+            struct.unpack("<I", pkt[0:3] + b"\x00")[0],
+            pkt[3],
+            struct.unpack("<I", pkt[4:7] + b"\x00")[0],
+        )
+        # compressed payload length, sequence id, uncompressed payload length
+        return compressed_pll, seqid, uncompressed_pll
+
+    def _set_next_compressed_pktnr(self, next_id: Optional[int] = None) -> None:
+        """Set the given packet id, if any, else increment packet id."""
+        if next_id is None:
+            self._compressed_pktnr += 1
+        else:
+            self._compressed_pktnr = next_id
+        self._compressed_pktnr %= 256
+
+    async def _write_pkt(
+        self,
+        writer: StreamWriter,
+        address: str,
+        pkt: bytes,
+    ) -> None:
         """Compress packet and write it to the comm channel."""
         compressed_pkt = zlib.compress(pkt)
         pkt = (
@@ -297,83 +368,94 @@ class NetworkBrokerCompressed(NetworkBrokerPlain):
             + struct.pack("<I", len(pkt))[0:3]
             + compressed_pkt
         )
-        return super()._send_pkt(sock, address, pkt)
+        return await super()._write_pkt(writer, address, pkt)
 
-    def send(
+    async def write(
         self,
-        sock: socket.socket,
+        writer: StreamWriter,
         address: str,
         payload: bytes,
         packet_number: Optional[int] = None,
         compressed_packet_number: Optional[int] = None,
+        write_timeout: Optional[int] = None,
     ) -> None:
         """Send `payload` as compressed packets to the MySQL server.
 
         If provided a payload whose length is greater than `MAX_PAYLOAD_LENGTH`, it is
         broken down into packets.
         """
-        # get next packet numbers
-        if packet_number is None:
-            self._set_next_pktnr()
-        else:
-            self._pktnr = packet_number
-        if compressed_packet_number is None:
-            self._set_next_compressed_pktnr()
-        else:
-            self._compressed_pktnr = compressed_packet_number
+        # Get next packet numbers.
+        self._set_next_pktnr(packet_number)
+        self._set_next_compressed_pktnr(compressed_packet_number)
+        try:
+            payload_prep = bytearray(b"").join(
+                self._prepare_packets(payload, self._pktnr)
+            )
+            if len(payload) >= MAX_PAYLOAD_LENGTH - PACKET_HEADER_LENGTH:
+                # Sending a MySQL payload of the size greater or equal to 2^24 - 5 via
+                # compression leads to at least one extra compressed packet WHY? let's say
+                # len(payload) is MAX_PAYLOAD_LENGTH - 3; when preparing the payload, a
+                # header of size PACKET_HEADER_LENGTH is pre-appended to the payload.
+                # This means that len(payload_prep) is
+                # MAX_PAYLOAD_LENGTH - 3 + PACKET_HEADER_LENGTH = MAX_PAYLOAD_LENGTH + 1
+                # surpassing the maximum allowed payload size per packet.
+                offset = 0
 
-        payload_prep = bytearray(b"").join(self._prepare_packets(payload, self._pktnr))
-        if len(payload) >= MAX_PAYLOAD_LENGTH - PACKET_HEADER_LENGTH:
-            # sending a MySQL payload of the size greater or equal to 2^24 - 5
-            # via compression leads to at least one extra compressed packet
-            # WHY? let's say len(payload) is MAX_PAYLOAD_LENGTH - 3; when preparing
-            # the payload, a header of size PACKET_HEADER_LENGTH is pre-appended
-            # to the payload. This means that len(payload_prep) is
-            # MAX_PAYLOAD_LENGTH - 3 + PACKET_HEADER_LENGTH = MAX_PAYLOAD_LENGTH + 1
-            # surpassing the maximum allowed payload size per packet.
-            offset = 0
-
-            # send several MySQL packets
-            for _ in range(len(payload_prep) // MAX_PAYLOAD_LENGTH):
-                self._send_pkt(
-                    sock, address, payload_prep[offset : offset + MAX_PAYLOAD_LENGTH]
+                # Send several MySQL packets.
+                for _ in range(len(payload_prep) // MAX_PAYLOAD_LENGTH):
+                    await asyncio.wait_for(
+                        self._write_pkt(
+                            writer,
+                            address,
+                            payload_prep[offset : offset + MAX_PAYLOAD_LENGTH],
+                        ),
+                        write_timeout,
+                    )
+                    self._set_next_compressed_pktnr()
+                    offset += MAX_PAYLOAD_LENGTH
+                await asyncio.wait_for(
+                    self._write_pkt(writer, address, payload_prep[offset:]),
+                    write_timeout,
                 )
-                self._set_next_compressed_pktnr()
-                offset += MAX_PAYLOAD_LENGTH
-            self._send_pkt(sock, address, payload_prep[offset:])
-        else:
-            # send one MySQL packet
-            # For small packets it may be too costly to compress the packet.
-            # Usually payloads less than 50 bytes (MIN_COMPRESS_LENGTH)
-            # aren't compressed (see MySQL source code Documentation).
-            if len(payload) > MIN_COMPRESS_LENGTH:
-                # perform compression
-                self._send_pkt(sock, address, payload_prep)
             else:
-                # skip compression
-                super()._send_pkt(
-                    sock,
-                    address,
-                    struct.pack("<I", len(payload_prep))[0:3]
-                    + struct.pack("<B", self._compressed_pktnr)
-                    + struct.pack("<I", 0)[0:3]
-                    + payload_prep,
-                )
+                # Send one MySQL packet.
+                # For small packets it may be too costly to compress the packet.
+                # Usually payloads less than 50 bytes (MIN_COMPRESS_LENGTH) aren't
+                # compressed (see MySQL source code Documentation).
+                if len(payload) > MIN_COMPRESS_LENGTH:
+                    # Perform compression.
+                    await asyncio.wait_for(
+                        self._write_pkt(writer, address, payload_prep), write_timeout
+                    )
+                else:
+                    # Skip compression.
+                    await asyncio.wait_for(
+                        super()._write_pkt(
+                            writer,
+                            address,
+                            struct.pack("<I", len(payload_prep))[0:3]
+                            + struct.pack("<B", self._compressed_pktnr)
+                            + struct.pack("<I", 0)[0:3]
+                            + payload_prep,
+                        ),
+                        write_timeout,
+                    )
+        except (asyncio.CancelledError, asyncio.TimeoutError) as err:
+            raise WriteTimeoutError(errno=3024) from err
 
-    def _recv_compressed_pkt(
-        self, sock: socket.socket, compressed_pll: int, uncompressed_pll: int
+    async def _read_compressed_pkt(
+        self,
+        reader: asyncio.StreamReader,
+        compressed_pll: int,
+        read_timeout: Optional[int] = None,
     ) -> None:
         """Handle reading of a compressed packet."""
         # compressed_pll stands for compressed payload length.
-        # Recalling that if uncompressed payload length == 0, the packet
-        # comes in uncompressed, so no decompression is needed.
-        compressed_pkt = super()._recv_chunk(sock, size=compressed_pll)
-        pkt = (
-            compressed_pkt
-            if uncompressed_pll == 0
-            else bytearray(zlib.decompress(compressed_pkt))
+        pkt = bytearray(
+            zlib.decompress(
+                await super()._read_chunk(reader, compressed_pll, read_timeout)
+            )
         )
-
         offset = 0
         while offset < len(pkt):
             # pll stands for payload length
@@ -381,24 +463,24 @@ class NetworkBrokerCompressed(NetworkBrokerPlain):
                 "<I", pkt[offset : offset + PACKET_HEADER_LENGTH - 1] + b"\x00"
             )[0]
             if PACKET_HEADER_LENGTH + pll > len(pkt) - offset:
-                # More bytes need to be consumed
-                # Read the header of the next MySQL packet
-                header = super()._recv_chunk(sock, size=COMPRESSED_PACKET_HEADER_LENGTH)
+                # More bytes need to be consumed.
+                # Read the header of the next MySQL packet.
+                header = await super()._read_chunk(
+                    reader, COMPRESSED_PACKET_HEADER_LENGTH, read_timeout
+                )
 
-                # compressed payload length, sequence id, uncompressed payload length
+                # compressed payload length, sequence id, uncompressed payload length.
                 (
                     compressed_pll,
                     self._compressed_pktnr,
                     uncompressed_pll,
-                ) = (
-                    struct.unpack("<I", header[0:3] + b"\x00")[0],
-                    header[3],
-                    struct.unpack("<I", header[4:7] + b"\x00")[0],
+                ) = self.get_header(header)
+                compressed_pkt = await super()._read_chunk(
+                    reader, compressed_pll, read_timeout
                 )
-                compressed_pkt = super()._recv_chunk(sock, size=compressed_pll)
 
-                # recalling that if uncompressed payload length == 0, the packet
-                # comes in uncompressed, so no decompression is needed.
+                # Recalling that if uncompressed payload length == 0, the packet comes
+                # in uncompressed, so no decompression is needed.
                 pkt += (
                     compressed_pkt
                     if uncompressed_pll == 0
@@ -408,28 +490,40 @@ class NetworkBrokerCompressed(NetworkBrokerPlain):
             self._queue_read.append(pkt[offset : offset + PACKET_HEADER_LENGTH + pll])
             offset += PACKET_HEADER_LENGTH + pll
 
-    def recv(self, sock: socket.socket, address: str) -> bytearray:
+    async def read(
+        self,
+        reader: asyncio.StreamReader,
+        address: str,
+        read_timeout: Optional[int] = None,
+    ) -> bytearray:
         """Receive `one` or `several` packets from the MySQL server, enqueue them, and
         return the packet at the head.
         """
+
         if not self._queue_read:
             try:
-                # Read the header of the next MySQL packet
-                header = super()._recv_chunk(sock, size=COMPRESSED_PACKET_HEADER_LENGTH)
+                # Read the header of the next MySQL packet.
+                header = await super()._read_chunk(
+                    reader, COMPRESSED_PACKET_HEADER_LENGTH, read_timeout
+                )
 
                 # compressed payload length, sequence id, uncompressed payload length
                 (
                     compressed_pll,
                     self._compressed_pktnr,
                     uncompressed_pll,
-                ) = (
-                    struct.unpack("<I", header[0:3] + b"\x00")[0],
-                    header[3],
-                    struct.unpack("<I", header[4:7] + b"\x00")[0],
-                )
-                self._recv_compressed_pkt(sock, compressed_pll, uncompressed_pll)
-            except (socket.timeout, TimeoutError) as err:
-                raise ReadTimeoutError(errno=3024) from err
+                ) = self.get_header(header)
+
+                if uncompressed_pll == 0:
+                    # Packet is not compressed, so just store it.
+                    self._queue_read.append(
+                        await super()._read_chunk(reader, compressed_pll, read_timeout)
+                    )
+                else:
+                    # Packet comes in compressed, further action is needed.
+                    await self._read_compressed_pkt(
+                        reader, compressed_pll, read_timeout
+                    )
             except IOError as err:
                 raise OperationalError(
                     errno=2055, values=(address, _strioerror(err))
@@ -455,75 +549,98 @@ class MySQLSocket(ABC):
         """Network layer where transactions are made with plain (uncompressed) packets
         is enabled by default.
         """
-        # holds the socket connection
-        self.sock: Optional[socket.socket] = None
+        self._reader: Optional[asyncio.StreamReader] = None
+        self._writer: Optional[StreamWriter] = None
         self._connection_timeout: Optional[int] = None
-        self.server_host: Optional[str] = None
+        self._address: Optional[str] = None
         self._netbroker: NetworkBroker = NetworkBrokerPlain()
+        self._is_connected: bool = False
+
+    @property
+    def address(self) -> str:
+        """Socket location."""
+        return self._address
+
+    @abstractmethod
+    async def open_connection(self, **kwargs: Any) -> None:
+        """Open the socket."""
+
+    async def close_connection(self) -> None:
+        """Close the connection."""
+        if self._writer:
+            try:
+                self._writer.close()
+                # Without transport.abort(), an error is raised when using SSL
+                if self._writer.transport is not None:
+                    self._writer.transport.abort()
+                await self._writer.wait_closed()
+            except Exception as _:  # pylint: disable=broad-exception-caught)
+                # we can ignore issues like ConnectionRefused or ConnectionAborted
+                # as these instances might popup if the connection was closed due to timeout issues
+                pass
+        self._is_connected = False
+
+    def is_connected(self) -> bool:
+        """Check if the socket is connected.
+
+        Return:
+            bool: Returns `True` if the socket is connected to MySQL server.
+        """
+        return self._is_connected
+
+    def set_connection_timeout(self, timeout: int) -> None:
+        """Set the connection timeout."""
+        self._connection_timeout = timeout
 
     def switch_to_compressed_mode(self) -> None:
         """Enable network layer where transactions are made with compressed packets."""
         self._netbroker = NetworkBrokerCompressed()
 
-    def shutdown(self) -> None:
-        """Shut down the socket before closing it."""
-        try:
-            self.sock.shutdown(socket.SHUT_RDWR)
-            self.sock.close()
-        except (AttributeError, OSError):
-            pass
+    async def switch_to_ssl(self, ssl_context: ssl.SSLContext) -> None:
+        """Upgrade an existing stream-based connection to TLS.
 
-    def close_connection(self) -> None:
-        """Close the socket."""
-        try:
-            self.sock.close()
-        except (AttributeError, OSError):
-            pass
+        The `start_tls()` method from `asyncio.streams.StreamWriter` is only available
+        in Python 3.11. This method is used as a workaround.
 
-    def __del__(self) -> None:
-        self.shutdown()
-
-    def set_connection_timeout(self, timeout: Optional[int]) -> None:
-        """Set the connection timeout."""
-        self._connection_timeout = timeout
-        if self.sock:
-            self.sock.settimeout(timeout)
-
-    def switch_to_ssl(self, ssl_context: Any, host: str) -> None:
-        """Upgrade an existing connection to TLS.
+        The MySQL TLS negotiation happens in the middle of the TCP connection.
+        Therefore, passing a socket to open connection will cause it to negotiate
+        TLS on an existing connection.
 
         Args:
-            ssl_context (ssl.SSLContext): The SSL Context to be used.
-            host (str): Server host name.
-
-        Returns:
-            None.
+            ssl_context: The SSL Context to be used.
 
         Raises:
-            ProgrammingError: If the transport does not expose the socket instance.
-            NotSupportedError: If Python installation has no SSL support.
+            RuntimeError: If the transport does not expose the socket instance.
         """
-        # Ensure that self.sock is already created
-        assert self.sock is not None
+        # Ensure that self._writer is already created
+        assert self._writer is not None
 
-        if self.sock.family == 1:  # socket.AF_UNIX
+        socket = self._writer.transport.get_extra_info("socket")
+        if socket.family == 1:  # socket.AF_UNIX
             raise ProgrammingError("SSL is not supported when using Unix sockets")
 
-        if ssl is None:
-            raise NotSupportedError("Python installation has no SSL support")
+        await self._writer.start_tls(ssl_context)
 
-        try:
-            self.sock = ssl_context.wrap_socket(self.sock, server_hostname=host)
-        except NameError as err:
-            raise NotSupportedError("Python installation has no SSL support") from err
-        except (ssl.SSLError, IOError) as err:
-            raise InterfaceError(
-                errno=2055, values=(self.address, _strioerror(err))
-            ) from err
-        except ssl.CertificateError as err:
-            raise InterfaceError(str(err)) from err
-        except NotImplementedError as err:
-            raise InterfaceError(str(err)) from err
+    async def write(
+        self,
+        payload: bytes,
+        packet_number: Optional[int] = None,
+        compressed_packet_number: Optional[int] = None,
+        write_timeout: Optional[int] = None,
+    ) -> None:
+        """Send packets to the MySQL server."""
+        await self._netbroker.write(
+            self._writer,
+            self.address,
+            payload,
+            packet_number=packet_number,
+            compressed_packet_number=compressed_packet_number,
+            write_timeout=write_timeout,
+        )
+
+    async def read(self, read_timeout: Optional[int] = None) -> bytearray:
+        """Read packets from the MySQL server."""
+        return await self._netbroker.read(self._reader, self.address, read_timeout)
 
     def build_ssl_context(
         self,
@@ -532,40 +649,17 @@ class MySQLSocket(ABC):
         ssl_key: Optional[str] = None,
         ssl_verify_cert: Optional[bool] = False,
         ssl_verify_identity: Optional[bool] = False,
-        tls_versions: Optional[List[str]] = None,
-        tls_cipher_suites: Optional[List[str]] = None,
-    ) -> Any:
-        """Build a SSLContext.
-
-        Args:
-            ssl_ca: Certificate authority, opptional.
-            ssl_cert: SSL certificate, optional.
-            ssl_key: Private key, optional.
-            ssl_verify_cert: Verify the SSL certificate if `True`.
-            ssl_verify_identity: Verify host identity if `True`.
-            tls_versions: TLS protocol versions, optional.
-            tls_cipher_suites: Set of steps that helps to establish a secure connection.
-
-        Returns:
-            ssl_context (ssl.SSLContext): An SSL Context ready be used.
-
-        Raises:
-            NotSupportedError: Python installation has no SSL support.
-            InterfaceError: Socket undefined or invalid ssl data.
-        """
+        tls_versions: Optional[List[str]] = [],
+        tls_cipher_suites: Optional[List[str]] = [],
+    ) -> ssl.SSLContext:
+        """Build a SSLContext."""
         tls_version: Optional[str] = None
 
-        if not self.sock:
+        if not self._reader:
             raise InterfaceError(errno=2048)
 
         if ssl is None:
-            raise NotSupportedError("Python installation has no SSL support")
-
-        if tls_versions is None:
-            tls_versions = []
-
-        if tls_cipher_suites is None:
-            tls_cipher_suites = []
+            raise RuntimeError("Python installation has no SSL support")
 
         try:
             if tls_versions:
@@ -582,7 +676,6 @@ class MySQLSocket(ABC):
                     if "TLSv1" not in tls_versions:
                         context.options |= ssl.OP_NO_TLSv1
             else:
-                # `check_hostname` is True by default
                 context = ssl.create_default_context()
 
             context.check_hostname = ssl_verify_identity
@@ -623,189 +716,50 @@ class MySQLSocket(ABC):
         ) as err:
             raise InterfaceError(str(err)) from err
 
-    def send(
-        self,
-        payload: bytes,
-        packet_number: Optional[int] = None,
-        compressed_packet_number: Optional[int] = None,
-        write_timeout: Optional[int] = None,
-    ) -> None:
-        """Send `payload` to the MySQL server.
 
-        NOTE: if `payload` is an instance of `bytearray`, then `payload` might be
-        changed by this method - `bytearray` is similar to passing a variable by
-        reference.
+class MySQLTcpSocket(MySQLSocket):
+    """MySQL socket class using TCP/IP.
 
-        If you're sure you won't read `payload` after invoking `send()`,
-        then you can use `bytearray.` Otherwise, you must use `bytes`.
-        """
-        try:
-            if (
-                not self._connection_timeout and self.sock is not None
-            ):  # can't update the timeout during connection phase
-                self.sock.settimeout(float(write_timeout) if write_timeout else None)
-        except OSError as _:
-            # Ignore the OSError as the socket might not be setup properly
-            pass
-        self._netbroker.send(
-            self.sock,
-            self.address,
-            payload,
-            packet_number=packet_number,
-            compressed_packet_number=compressed_packet_number,
+    Args:
+        host: MySQL host name.
+        port: MySQL port.
+        force_ipv6: Force IPv6 usage.
+    """
+
+    def __init__(
+        self, host: str = "127.0.0.1", port: int = 3306, force_ipv6: bool = False
+    ):
+        super().__init__()
+        self._host: str = host
+        self._port: int = port
+        self._force_ipv6: bool = force_ipv6
+        self._address: str = f"{host}:{port}"
+
+    async def open_connection(self, **kwargs: Any) -> None:
+        """Open TCP/IP connection."""
+        self._reader, self._writer = await open_connection(
+            host=self._host, port=self._port, **kwargs
         )
-
-    def recv(self, read_timeout: Optional[int] = None) -> bytearray:
-        """Get packet from the MySQL server comm channel."""
-        try:
-            if (
-                not self._connection_timeout and self.sock is not None
-            ):  # can't update the timeout during connection phase
-                self.sock.settimeout(float(read_timeout) if read_timeout else None)
-        except OSError as _:
-            # Ignore the OSError as the socket might not be setup properly
-            pass
-        return self._netbroker.recv(self.sock, self.address)
-
-    @abstractmethod
-    def open_connection(self) -> None:
-        """Open the socket."""
-
-    @property
-    @abstractmethod
-    def address(self) -> str:
-        """Get the location of the socket."""
+        self._is_connected = True
 
 
 class MySQLUnixSocket(MySQLSocket):
     """MySQL socket class using UNIX sockets.
 
-    Opens a connection through the UNIX socket of the MySQL Server.
+    Args:
+        unix_socket: UNIX socket file path.
     """
 
-    def __init__(self, unix_socket: str = "/tmp/mysql.sock") -> None:
+    def __init__(self, unix_socket: str = "/tmp/mysql.sock"):
         super().__init__()
-        self.unix_socket: str = unix_socket
         self._address: str = unix_socket
 
-    @property
-    def address(self) -> str:
-        return self._address
-
-    def open_connection(self) -> None:
-        try:
-            self.sock = socket.socket(
-                # pylint: disable=no-member
-                socket.AF_UNIX,
-                socket.SOCK_STREAM,
-            )
-            self.sock.settimeout(self._connection_timeout)
-            self.sock.connect(self.unix_socket)
-        except (socket.timeout, TimeoutError) as err:
-            raise ConnectionTimeoutError(
-                errno=2002,
-                values=(
-                    self.address,
-                    _strioerror(err),
-                ),
-            ) from err
-        except IOError as err:
-            raise InterfaceError(
-                errno=2002, values=(self.address, _strioerror(err))
-            ) from err
-        except Exception as err:
-            raise InterfaceError(str(err)) from err
-
-    def switch_to_ssl(
-        self, *args: Any, **kwargs: Any  # pylint: disable=unused-argument
-    ) -> None:
-        """Switch the socket to use SSL."""
-        warnings.warn(
-            "SSL is disabled when using unix socket connections",
-            Warning,
+    async def open_connection(self, **kwargs: Any) -> None:
+        """Open UNIX socket connection."""
+        (
+            self._reader,
+            self._writer,
+        ) = await asyncio.open_unix_connection(  # type: ignore[assignment]
+            path=self._address, **kwargs
         )
-
-
-class MySQLTCPSocket(MySQLSocket):
-    """MySQL socket class using TCP/IP.
-
-    Opens a TCP/IP connection to the MySQL Server.
-    """
-
-    def __init__(
-        self,
-        host: str = "127.0.0.1",
-        port: int = 3306,
-        force_ipv6: bool = False,
-    ) -> None:
-        super().__init__()
-        self.server_host: str = host
-        self.server_port: int = port
-        self.force_ipv6: bool = force_ipv6
-        self._family: int = 0
-        self._address: str = f"{host}:{port}"
-
-    @property
-    def address(self) -> str:
-        return self._address
-
-    def open_connection(self) -> None:
-        """Open the TCP/IP connection to the MySQL server."""
-        # pylint: disable=no-member
-        # Get address information
-        addrinfo: Tuple[
-            socket.AddressFamily,
-            socket.SocketKind,
-            int,
-            str,
-            Union[tuple[str, int], tuple[str, int, int, int], tuple[int, bytes]],
-        ] = (None, None, None, None, None)
-        try:
-            addrinfos = socket.getaddrinfo(
-                self.server_host,
-                self.server_port,
-                0,
-                socket.SOCK_STREAM,
-                socket.SOL_TCP,
-            )
-            # If multiple results we favor IPv4, unless IPv6 was forced.
-            for info in addrinfos:
-                if self.force_ipv6 and info[0] == socket.AF_INET6:
-                    addrinfo = info
-                    break
-                if info[0] == socket.AF_INET:
-                    addrinfo = info
-                    break
-            if self.force_ipv6 and addrinfo[0] is None:
-                raise InterfaceError(f"No IPv6 address found for {self.server_host}")
-            if addrinfo[0] is None:
-                addrinfo = addrinfos[0]
-        except IOError as err:
-            raise InterfaceError(
-                errno=2003,
-                values=(self.server_host, self.server_port, _strioerror(err)),
-            ) from err
-
-        (self._family, socktype, proto, _, sockaddr) = addrinfo
-
-        # Instantiate the socket and connect
-        try:
-            self.sock = socket.socket(self._family, socktype, proto)
-            self.sock.settimeout(self._connection_timeout)
-            self.sock.connect(sockaddr)
-        except (socket.timeout, TimeoutError) as err:
-            raise ConnectionTimeoutError(
-                errno=2003,
-                values=(
-                    self.server_host,
-                    self.server_port,
-                    _strioerror(err),
-                ),
-            ) from err
-        except IOError as err:
-            raise InterfaceError(
-                errno=2003,
-                values=(self.server_host, self.server_port, _strioerror(err)),
-            ) from err
-        except Exception as err:
-            raise InterfaceError(str(err)) from err
+        self._is_connected = True

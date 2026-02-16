@@ -33,7 +33,8 @@ import warnings
 
 from typing import TYPE_CHECKING, Any, Callable
 
-from .constants import RefreshOption
+from ..constants import RefreshOption
+from ..errors import ReadTimeoutError, WriteTimeoutError
 
 if TYPE_CHECKING:
     from .abstracts import MySQLConnectionAbstract
@@ -45,7 +46,7 @@ def cmd_refresh_verify_options() -> Callable:
 
     def decorator(cmd_refresh: Callable) -> Callable:
         @functools.wraps(cmd_refresh)
-        def wrapper(
+        async def wrapper(
             cnx: "MySQLConnectionAbstract", *args: Any, **kwargs: Any
         ) -> Callable:
             options: int = args[0]
@@ -63,7 +64,25 @@ def cmd_refresh_verify_options() -> Callable:
                     stacklevel=1,
                 )
 
-            return cmd_refresh(cnx, options, **kwargs)
+            return await cmd_refresh(cnx, options, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+def deprecated(reason: str) -> Callable:
+    """Use it to decorate deprecated methods."""
+
+    def decorator(func: Callable) -> Callable:
+        @functools.wraps(func)
+        async def wrapper(*args: Any, **kwargs: Any) -> Callable:
+            warnings.warn(
+                f"Call to deprecated function {func.__name__}. Reason: {reason}",
+                category=DeprecationWarning,
+                stacklevel=2,
+            )
+            return await func(*args, **kwargs)
 
         return wrapper
 
@@ -78,34 +97,16 @@ def handle_read_write_timeout() -> Callable:
 
     def decorator(cnx_method: Callable) -> Callable:
         @functools.wraps(cnx_method)
-        def handle_cnx_method(
+        async def handle_cnx_method(
             cnx: "MySQLConnectionAbstract", *args: Any, **kwargs: Any
         ) -> Any:
             try:
-                return cnx_method(cnx, *args, **kwargs)
+                return await cnx_method(cnx, *args, **kwargs)
             except Exception as err:
-                if isinstance(err, TimeoutError):
-                    cnx.close()
+                if isinstance(err, (ReadTimeoutError, WriteTimeoutError)):
+                    await cnx.close()
                 raise err
 
         return handle_cnx_method
-
-    return decorator
-
-
-def deprecated(reason: str) -> Callable:
-    """Use it to decorate deprecated methods."""
-
-    def decorator(func: Callable) -> Callable:
-        @functools.wraps(func)
-        def wrapper(*args: Any, **kwargs: Any) -> Callable:
-            warnings.warn(
-                f"Call to deprecated function {func.__name__}. Reason: {reason}",
-                category=DeprecationWarning,
-                stacklevel=2,
-            )
-            return func(*args, **kwargs)
-
-        return wrapper
 
     return decorator

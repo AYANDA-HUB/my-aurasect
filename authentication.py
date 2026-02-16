@@ -1,4 +1,4 @@
-# Copyright (c) 2014, 2024, Oracle and/or its affiliates.
+# Copyright (c) 2023, 2024, Oracle and/or its affiliates.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License, version 2.0, as
@@ -26,15 +26,16 @@
 # along with this program; if not, write to the Free Software Foundation, Inc.,
 # 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
 
-"""Implementing support for MySQL Authentication Plugins"""
+"""Implementing support for MySQL Authentication Plugins."""
+
 from __future__ import annotations
+
+__all__ = ["MySQLAuthenticator"]
 
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
-from .errors import InterfaceError, NotSupportedError, get_exception
-from .logger import logger
-from .plugins import MySQLAuthPlugin, get_auth_plugin
-from .protocol import (
+from ..errors import InterfaceError, NotSupportedError, get_exception
+from ..protocol import (
     AUTH_SWITCH_STATUS,
     DEFAULT_CHARSET_ID,
     DEFAULT_MAX_ALLOWED_PACKET,
@@ -42,9 +43,11 @@ from .protocol import (
     EXCHANGE_FURTHER_STATUS,
     MFA_STATUS,
     OK_STATUS,
-    MySQLProtocol,
 )
-from .types import HandShakeType
+from ..types import HandShakeType
+from .logger import logger
+from .plugins import MySQLAuthPlugin, get_auth_plugin
+from .protocol import MySQLProtocol
 
 if TYPE_CHECKING:
     from .network import MySQLSocket
@@ -69,7 +72,7 @@ class MySQLAuthenticator:
 
     @property
     def plugin_config(self) -> Dict[str, Any]:
-        """Custom arguments that are being provided to the authentication plugin when called.
+        """Custom arguments that are being provided to the authentication plugin.
 
         The parameters defined here will override the ones defined in the
         auth plugin itself.
@@ -88,63 +91,6 @@ class MySQLAuthenticator:
         """Update the 'plugin_config' instance variable"""
         self._plugin_config.update(config)
 
-    def setup_ssl(
-        self,
-        sock: MySQLSocket,
-        host: str,
-        ssl_options: Optional[Dict[str, Any]],
-        charset: int = DEFAULT_CHARSET_ID,
-        client_flags: int = 0,
-        max_allowed_packet: int = DEFAULT_MAX_ALLOWED_PACKET,
-    ) -> bytes:
-        """Sets up an SSL communication channel.
-
-        Args:
-            sock: Pointer to the socket connection.
-            host: Server host name.
-            ssl_options: SSL and TLS connection options (see
-                         `network.MySQLSocket.build_ssl_context`).
-            charset: Client charset (see [1]), only the lower 8-bits.
-            client_flags: Integer representing client capabilities flags.
-            max_allowed_packet: Maximum packet size.
-
-        Returns:
-            ssl_request_payload: Payload used to carry out SSL authentication.
-
-        References:
-            [1]: https://dev.mysql.com/doc/dev/mysql-server/latest/\
-                page_protocol_basic_character_set.html#a_protocol_character_set
-        """
-        if ssl_options is None:
-            ssl_options = {}
-
-        # SSL connection request packet
-        ssl_request_payload = MySQLProtocol.make_auth_ssl(
-            charset=charset,
-            client_flags=client_flags,
-            max_allowed_packet=max_allowed_packet,
-        )
-        sock.send(ssl_request_payload)
-
-        logger.debug("Building SSL context")
-        ssl_context = sock.build_ssl_context(
-            ssl_ca=ssl_options.get("ca"),
-            ssl_cert=ssl_options.get("cert"),
-            ssl_key=ssl_options.get("key"),
-            ssl_verify_cert=ssl_options.get("verify_cert", False),
-            ssl_verify_identity=ssl_options.get("verify_identity", False),
-            tls_versions=ssl_options.get("tls_versions"),
-            tls_cipher_suites=ssl_options.get("tls_ciphersuites"),
-        )
-
-        logger.debug("Switching to SSL")
-        sock.switch_to_ssl(ssl_context, host)
-
-        logger.debug("SSL has been enabled")
-        self._ssl_enabled = True
-
-        return ssl_request_payload
-
     def _switch_auth_strategy(
         self,
         new_strategy_name: str,
@@ -152,7 +98,7 @@ class MySQLAuthenticator:
         username: Optional[str] = None,
         password_factor: int = 1,
     ) -> None:
-        """Switches the authorization plugin.
+        """Switch the authorization plugin.
 
         Args:
             new_strategy_name: New authorization plugin name to switch to.
@@ -179,12 +125,12 @@ class MySQLAuthenticator:
             ssl_enabled=self.ssl_enabled,
         )
 
-    def _mfa_n_factor(
+    async def _mfa_n_factor(
         self,
         sock: MySQLSocket,
         pkt: bytes,
     ) -> Optional[bytes]:
-        """Handles MFA (Multi-Factor Authentication) response.
+        """Handle MFA (Multi-Factor Authentication) response.
 
         Up to three levels of authentication (MFA) are allowed.
 
@@ -211,13 +157,13 @@ class MySQLAuthenticator:
             self._switch_auth_strategy(new_strategy_name, password_factor=n_factor)
             logger.debug("MFA %i factor %s", n_factor, self._auth_strategy.name)
 
-            pkt = self._auth_strategy.auth_switch_response(
+            pkt = await self._auth_strategy.auth_switch_response(
                 sock, auth_data, **self._plugin_config
             )
 
             if pkt[4] == EXCHANGE_FURTHER_STATUS:
                 auth_data = MySQLProtocol.parse_auth_more_data(pkt)
-                pkt = self._auth_strategy.auth_more_response(
+                pkt = await self._auth_strategy.auth_more_response(
                     sock, auth_data, **self._plugin_config
                 )
 
@@ -233,12 +179,12 @@ class MySQLAuthenticator:
         logger.warning("MFA terminated with a no ok packet")
         return None
 
-    def _handle_server_response(
+    async def _handle_server_response(
         self,
         sock: MySQLSocket,
         pkt: bytes,
     ) -> Optional[bytes]:
-        """Handles server's response.
+        """Handle server's response.
 
         Args:
             sock: Pointer to the socket connection.
@@ -263,14 +209,14 @@ class MySQLAuthenticator:
             logger.debug("Server's response is an auth switch request")
             new_strategy_name, auth_data = MySQLProtocol.parse_auth_switch_request(pkt)
             self._switch_auth_strategy(new_strategy_name)
-            pkt = self._auth_strategy.auth_switch_response(
+            pkt = await self._auth_strategy.auth_switch_response(
                 sock, auth_data, **self._plugin_config
             )
 
         if pkt[4] == EXCHANGE_FURTHER_STATUS:
             logger.debug("Exchanging further packets")
             auth_data = MySQLProtocol.parse_auth_more_data(pkt)
-            pkt = self._auth_strategy.auth_more_response(
+            pkt = await self._auth_strategy.auth_more_response(
                 sock, auth_data, **self._plugin_config
             )
 
@@ -281,14 +227,14 @@ class MySQLAuthenticator:
         if pkt[4] == MFA_STATUS:
             logger.debug("Starting multi-factor authentication")
             logger.debug("MFA 1 factor %s", self._auth_strategy.name)
-            return self._mfa_n_factor(sock, pkt)
+            return await self._mfa_n_factor(sock, pkt)
 
         if pkt[4] == ERR_STATUS:
             raise get_exception(pkt)
 
         return None
 
-    def authenticate(
+    async def authenticate(
         self,
         sock: MySQLSocket,
         handshake: HandShakeType,
@@ -299,6 +245,7 @@ class MySQLAuthenticator:
         database: Optional[str] = None,
         charset: int = DEFAULT_CHARSET_ID,
         client_flags: int = 0,
+        ssl_enabled: bool = False,
         max_allowed_packet: int = DEFAULT_MAX_ALLOWED_PACKET,
         auth_plugin: Optional[str] = None,
         auth_plugin_class: Optional[str] = None,
@@ -307,7 +254,7 @@ class MySQLAuthenticator:
         read_timeout: Optional[int] = None,
         write_timeout: Optional[int] = None,
     ) -> bytes:
-        """Performs the authentication phase.
+        """Perform the authentication phase.
 
         During re-authentication you must set `is_change_user_request` to True.
 
@@ -321,6 +268,7 @@ class MySQLAuthenticator:
             database: Initial database name for the connection.
             charset: Client charset (see [1]), only the lower 8-bits.
             client_flags: Integer representing client capabilities flags.
+            ssl_enabled: Boolean indicating whether SSL is enabled,
             max_allowed_packet: Maximum packet size.
             auth_plugin: Authorization plugin name.
             auth_plugin_class: Authorization plugin class (has higher precedence
@@ -331,6 +279,7 @@ class MySQLAuthenticator:
                           the server to reply back before raising an ReadTimeoutError.
             write_timeout: Timeout in seconds upto which the connector should spend to
                            send data to the server before raising an WriteTimeoutError.
+
         Returns:
             ok_packet: OK packet.
 
@@ -348,6 +297,7 @@ class MySQLAuthenticator:
         # update credentials, plugin config and plugin class
         self._username = username
         self._passwords = {1: password1, 2: password2, 3: password3}
+        self._ssl_enabled = ssl_enabled
         self._auth_plugin_class = auth_plugin_class
 
         # client's handshake response
@@ -373,12 +323,12 @@ class MySQLAuthenticator:
             if is_change_user_request
             else (None, None, write_timeout)
         )
-        sock.send(response_payload, *send_args)
+        await sock.write(response_payload, *send_args)
 
         # server replies back
-        pkt = bytes(sock.recv(read_timeout))
+        pkt = bytes(await sock.read(read_timeout))
 
-        ok_pkt = self._handle_server_response(sock, pkt)
+        ok_pkt = await self._handle_server_response(sock, pkt)
         if ok_pkt is None:
             raise InterfaceError("Got a NULL ok_pkt") from None
 
