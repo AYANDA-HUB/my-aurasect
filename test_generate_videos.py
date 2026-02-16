@@ -12,6 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+"""Tests for generate_videos."""
+
+import os
+from .... import types
+from ... import pytest_helper
+
+VEO_MODEL_LATEST = "veo-2.0-generate-001"
 
 
-"""Tests for the Google GenAI SDK's _mcp_utils module."""
+test_table: list[pytest_helper.TestTableItem] = [
+    pytest_helper.TestTableItem(
+        name="test_simple_prompt",
+        parameters=types._GenerateVideosParameters(
+            model=VEO_MODEL_LATEST,
+            prompt="Man with a dog",
+        ),
+    ),
+]
+pytestmark = pytest_helper.setup(
+    file=__file__,
+    globals_for_file=globals(),
+    test_method="models.generate_videos",
+    test_table=test_table,
+)

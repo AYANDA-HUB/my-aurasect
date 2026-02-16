@@ -14,4 +14,26 @@
 #
 
 
-"""Tests for the Google GenAI SDK's _mcp_utils module."""
+"""Tests for tunings.list()."""
+
+from .... import types as genai_types
+from ... import pytest_helper
+
+
+test_table: list[pytest_helper.TestTableItem] = [
+    pytest_helper.TestTableItem(
+        name='test_default',
+        parameters=genai_types._ListTuningJobsParameters(
+            config=genai_types.ListTuningJobsConfig(page_size=1)
+        ),
+    ),
+]
+
+pytestmark = pytest_helper.setup(
+    file=__file__,
+    globals_for_file=globals(),
+    test_method='tunings.list',
+    test_table=test_table,
+)
+
+pytest_plugins = ('pytest_asyncio',)

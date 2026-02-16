@@ -14,4 +14,21 @@
 #
 
 
-"""Tests for the Google GenAI SDK's _mcp_utils module."""
+"""Test for the code sample for Gemini text-only request."""
+
+from .. import pytest_helper
+
+pytestmark = pytest_helper.setup(file=__file__)
+
+
+def test_sample(client):
+  # [START generativeaionvertexai_gemini_text_only]
+  response = client.models.generate_content(
+      model="gemini-2.5-flash",
+      contents=(
+          "What's a good name for a flower shop that specializes in selling"
+          " bouquets of dried flowers?"
+      ),
+  )
+  print(response.text)
+  # [END generativeaionvertexai_gemini_text_only]
