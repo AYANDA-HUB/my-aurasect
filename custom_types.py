@@ -1,4 +1,4 @@
-# Copyright (c) 2014, 2025, Oracle and/or its affiliates.
+# Copyright (c) 2014, 2024, Oracle and/or its affiliates.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License, version 2.0, as
@@ -25,3 +25,25 @@
 # You should have received a copy of the GNU General Public License
 # along with this program; if not, write to the Free Software Foundation, Inc.,
 # 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+
+"""Custom Python types used by MySQL Connector/Python"""
+from __future__ import annotations
+
+from typing import Type
+
+
+class HexLiteral(str):
+    """Class holding MySQL hex literals"""
+
+    charset: str = ""
+    original: str = ""
+
+    def __new__(cls: Type[HexLiteral], str_: str, charset: str = "utf8") -> HexLiteral:
+        hexed = [f"{i:02x}" for i in str_.encode(charset)]
+        obj = str.__new__(cls, "".join(hexed))
+        obj.charset = charset
+        obj.original = str_
+        return obj
+
+    def __str__(self) -> str:
+        return "0x" + self

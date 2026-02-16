@@ -1,4 +1,4 @@
-# Copyright (c) 2014, 2025, Oracle and/or its affiliates.
+# Copyright (c) 2020, 2024, Oracle and/or its affiliates.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License, version 2.0, as
@@ -25,3 +25,26 @@
 # You should have received a copy of the GNU General Public License
 # along with this program; if not, write to the Free Software Foundation, Inc.,
 # 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+
+"""Database Features."""
+
+from typing import Any, List
+
+from django.db.backends.mysql.features import DatabaseFeatures as MySQLDatabaseFeatures
+from django.utils.functional import cached_property
+
+
+class DatabaseFeatures(MySQLDatabaseFeatures):
+    """Database Features Specification class."""
+
+    empty_fetchmany_value: List[Any] = []
+
+    @cached_property
+    def can_introspect_check_constraints(self) -> bool:  # type: ignore[override]
+        """Check if backend support introspection CHECK of constraints."""
+        return self.connection.mysql_version >= (8, 0, 16)
+
+    @cached_property
+    def supports_microsecond_precision(self) -> bool:
+        """Check if backend support microsecond precision."""
+        return self.connection.mysql_version >= (5, 6, 3)

@@ -26,53 +26,64 @@
 # along with this program; if not, write to the Free Software Foundation, Inc.,
 # 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
 
-"""Base Authentication Plugin class."""
+"""Caching SHA2 Password Authentication Plugin."""
 
-import importlib
+import struct
 
-from abc import ABC, abstractmethod
-from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Optional, Type
+from hashlib import sha256
+from typing import TYPE_CHECKING, Any, Optional
 
-from ..errors import NotSupportedError, ProgrammingError
+from ..errors import InterfaceError
 from ..logger import logger
+from . import MySQLAuthPlugin
 
 if TYPE_CHECKING:
     from ..network import MySQLSocket
 
-DEFAULT_PLUGINS_PKG = "mysql.connector.plugins"
+AUTHENTICATION_PLUGIN_CLASS = "MySQLCachingSHA2PasswordAuthPlugin"
 
 
-class MySQLAuthPlugin(ABC):
-    """Authorization plugin interface."""
+class MySQLCachingSHA2PasswordAuthPlugin(MySQLAuthPlugin):
+    """Class implementing the MySQL caching_sha2_password authentication plugin
 
-    def __init__(
-        self,
-        username: str,
-        password: str,
-        ssl_enabled: bool = False,
-    ) -> None:
-        """Constructor."""
-        self._username: str = "" if username is None else username
-        self._password: str = "" if password is None else password
-        self._ssl_enabled: bool = ssl_enabled
+    Note that encrypting using RSA is not supported since the Python
+    Standard Library does not provide this OpenSSL functionality.
+    """
+
+    perform_full_authentication: int = 4
+
+    def _scramble(self, auth_data: bytes) -> bytes:
+        """Return a scramble of the password using a Nonce sent by the
+        server.
+
+        The scramble is of the form:
+        XOR(SHA2(password), SHA2(SHA2(SHA2(password)), Nonce))
+        """
+        if not auth_data:
+            raise InterfaceError("Missing authentication data (seed)")
+
+        if not self._password:
+            return b""
+
+        hash1 = sha256(self._password.encode()).digest()
+        hash2 = sha256()
+        hash2.update(sha256(hash1).digest())
+        hash2.update(auth_data)
+        hash2_digest = hash2.digest()
+        xored = [h1 ^ h2 for (h1, h2) in zip(hash1, hash2_digest)]
+        hash3 = struct.pack("32B", *xored)
+        return hash3
 
     @property
-    def ssl_enabled(self) -> bool:
-        """Signals whether or not SSL is enabled."""
-        return self._ssl_enabled
-
-    @property
-    @abstractmethod
-    def requires_ssl(self) -> bool:
-        """Signals whether or not SSL is required."""
-
-    @property
-    @abstractmethod
     def name(self) -> str:
         """Plugin official name."""
+        return "caching_sha2_password"
 
-    @abstractmethod
+    @property
+    def requires_ssl(self) -> bool:
+        """Signals whether or not SSL is required."""
+        return False
+
     def auth_response(self, auth_data: bytes, **kwargs: Any) -> Optional[bytes]:
         """Make the client's authorization response.
 
@@ -85,6 +96,15 @@ class MySQLAuthPlugin(ABC):
         Returns:
             packet: Client's authorization response.
         """
+        if not auth_data:
+            return None
+        if len(auth_data) > 1:
+            return self._scramble(auth_data)
+        if auth_data[0] == self.perform_full_authentication:
+            # return password as clear text.
+            return self._password.encode() + b"\x00"
+
+        return None
 
     def auth_more_response(
         self, sock: "MySQLSocket", auth_data: bytes, **kwargs: Any
@@ -100,11 +120,15 @@ class MySQLAuthPlugin(ABC):
                     defined in the auth plugin itself.
 
         Returns:
-            packet: Last server's response after back-and-forth communication.
+            packet: Last server's response after back-and-forth
+                    communication.
         """
-        raise NotImplementedError
+        response = self.auth_response(auth_data, **kwargs)
+        if response:
+            sock.send(response)
 
-    @abstractmethod
+        return bytes(sock.recv())
+
     def auth_switch_response(
         self, sock: "MySQLSocket", auth_data: bytes, **kwargs: Any
     ) -> bytes:
@@ -119,42 +143,17 @@ class MySQLAuthPlugin(ABC):
                     defined in the auth plugin itself.
 
         Returns:
-            packet: Last server's response after back-and-forth communication.
+            packet: Last server's response after back-and-forth
+                    communication.
         """
+        response = self.auth_response(auth_data, **kwargs)
+        if response is None:
+            raise InterfaceError("Got a NULL auth response")
 
+        logger.debug("# request: %s size: %s", response, len(response))
+        sock.send(response)
 
-@lru_cache(maxsize=10, typed=False)
-def get_auth_plugin(
-    plugin_name: str,
-    auth_plugin_class: Optional[str] = None,
-) -> Type[MySQLAuthPlugin]:
-    """Return authentication class based on plugin name
+        pkt = bytes(sock.recv())
+        logger.debug("# server response packet: %s", pkt)
 
-    This function returns the class for the authentication plugin plugin_name.
-    The returned class is a subclass of BaseAuthPlugin.
-
-    Args:
-        plugin_name (str): Authentication plugin name.
-        auth_plugin_class (str): Authentication plugin class name.
-
-    Raises:
-        NotSupportedError: When plugin_name is not supported.
-
-    Returns:
-        Subclass of `MySQLAuthPlugin`.
-    """
-    package = DEFAULT_PLUGINS_PKG
-    if plugin_name:
-        try:
-            logger.info("package: %s", package)
-            logger.info("plugin_name: %s", plugin_name)
-            plugin_module = importlib.import_module(f".{plugin_name}", package)
-            if not auth_plugin_class or not hasattr(plugin_module, auth_plugin_class):
-                auth_plugin_class = plugin_module.AUTHENTICATION_PLUGIN_CLASS
-            logger.info("AUTHENTICATION_PLUGIN_CLASS: %s", auth_plugin_class)
-            return getattr(plugin_module, auth_plugin_class)
-        except ModuleNotFoundError as err:
-            logger.warning("Requested Module was not found: %s", err)
-        except ValueError as err:
-            raise ProgrammingError(f"Invalid module name: {err}") from err
-    raise NotSupportedError(f"Authentication plugin '{plugin_name}' is not supported")
+        return pkt

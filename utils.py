@@ -1,4 +1,4 @@
-# Copyright (c) 2025 Oracle and/or its affiliates.
+# Copyright (c) 2009, 2025, Oracle and/or its affiliates.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License, version 2.0, as
@@ -25,549 +25,736 @@
 # You should have received a copy of the GNU General Public License
 # along with this program; if not, write to the Free Software Foundation, Inc.,
 # 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
-"""General utilities for AI features in MySQL Connector/Python.
 
-Includes helpers for:
-- defensive dict copying
-- temporary table lifecycle management
-- SQL execution and result conversions
-- DataFrame to/from SQL table utilities
-- schema/table/column name validation
-- array-like to DataFrame conversion
-"""
+"""Utilities."""
 
-import copy
-import json
-import random
-import re
-import string
+import importlib
+import os
+import platform
+import struct
+import subprocess
+import sys
+import unicodedata
+import warnings
 
-from contextlib import contextmanager
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
+from decimal import Decimal
+from functools import lru_cache
+from stringprep import (
+    in_table_a1,
+    in_table_b1,
+    in_table_c3,
+    in_table_c4,
+    in_table_c5,
+    in_table_c6,
+    in_table_c7,
+    in_table_c8,
+    in_table_c9,
+    in_table_c11,
+    in_table_c12,
+    in_table_c21_c22,
+    in_table_d1,
+    in_table_d2,
+)
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    Type,
+    Union,
+)
 
-import numpy as np
-import pandas as pd
+if TYPE_CHECKING:
+    from mysql.connector.abstracts import MySQLConnectionAbstract
 
-from mysql.ai.utils.atomic_cursor import atomic_transaction
+from .custom_types import HexLiteral
+from .tls_ciphers import DEPRECATED_TLS_CIPHERSUITES, DEPRECATED_TLS_VERSIONS
+from .types import StrOrBytes
 
-from mysql.connector.abstracts import MySQLConnectionAbstract
-from mysql.connector.cursor import MySQLCursorAbstract
-from mysql.connector.types import ParamsSequenceOrDictType
+__MYSQL_DEBUG__: bool = False
 
-VAR_NAME_SPACE = "mysql_ai"
-RANDOM_TABLE_NAME_LENGTH = 32
-
-PD_TO_SQL_DTYPE_MAPPING = {
-    "int64": "BIGINT",
-    "float64": "DOUBLE",
-    "object": "LONGTEXT",
-    "bool": "BOOLEAN",
-    "datetime64[ns]": "DATETIME",
-}
-
-DEFAULT_SCHEMA = "mysql_ai"
-
-# Misc Utilities
+NUMERIC_TYPES: Tuple[Type[int], Type[float], Type[Decimal], Type[HexLiteral]] = (
+    int,
+    float,
+    Decimal,
+    HexLiteral,
+)
 
 
-def copy_dict(options: Optional[dict]) -> dict:
+def intread(buf: Union[int, bytes]) -> int:
+    """Unpacks the given buffer to an integer"""
+    if isinstance(buf, int):
+        return buf
+    length, tmp = len(buf), bytearray()
+    if length == 1:
+        return buf[0]
+    if length <= 4:
+        tmp += buf + b"\x00" * (4 - length)
+        return int(struct.unpack("<I", tmp)[0])
+    tmp += buf + b"\x00" * (8 - length)
+    return int(struct.unpack("<Q", tmp)[0])
+
+
+def int1store(i: int) -> bytes:
     """
-    Make a defensive copy of a dictionary, or return an empty dict if None.
+    Takes an unsigned byte (1 byte) and packs it as a bytes-object.
 
-    Args:
-        options: param dict or None
-
-    Returns:
-        dict
+    Returns string.
     """
-    if options is None:
-        return {}
+    if i < 0 or i > 255:
+        raise ValueError("int1store requires 0 <= i <= 255")
+    return struct.pack("<B", i)
 
-    return copy.deepcopy(options)
 
-
-@contextmanager
-def temporary_sql_tables(
-    db_connection: MySQLConnectionAbstract,
-) -> Iterator[list[tuple[str, str]]]:
+def int2store(i: int) -> bytes:
     """
-    Context manager to track and automatically clean up temporary SQL tables.
+    Takes an unsigned short (2 bytes) and packs it as a bytes-object.
 
-    Args:
-        db_connection: Database connection object used to create and delete tables.
-
-    Returns:
-        None
-
-    Raises:
-        DatabaseError:
-            If a database connection issue occurs.
-            If an operational error occurs during execution.
-
-    Yields:
-        temporary_tables: List of (schema_name, table_name) tuples created during the
-            context. All tables in this list are deleted on context exit.
+    Returns string.
     """
-    temporary_tables: List[Tuple[str, str]] = []
-    try:
-        yield temporary_tables
-    finally:
-        with atomic_transaction(db_connection) as cursor:
-            for schema_name, table_name in temporary_tables:
-                delete_sql_table(cursor, schema_name, table_name)
+    if i < 0 or i > 65535:
+        raise ValueError("int2store requires 0 <= i <= 65535")
+    return struct.pack("<H", i)
 
 
-def execute_sql(
-    cursor: MySQLCursorAbstract, query: str, params: ParamsSequenceOrDictType = None
-) -> None:
+def int3store(i: int) -> bytes:
     """
-    Execute an SQL query with optional parameters using the given cursor.
+    Takes an unsigned integer (3 bytes) and packs it as a bytes-object.
 
-    Args:
-        cursor: MySQLCursorAbstract object to execute the query.
-        query: SQL query string to execute.
-        params: Optional sequence or dict providing parameters for the query.
-
-    Raises:
-        DatabaseError:
-            If the provided SQL query/params are invalid
-            If the query is valid but the sql raises as an exception
-            If a database connection issue occurs.
-            If an operational error occurs during execution.
-
-    Returns:
-        None
+    Returns string.
     """
-    cursor.execute(query, params or ())
+    if i < 0 or i > 16777215:
+        raise ValueError("int3store requires 0 <= i <= 16777215")
+    return struct.pack("<I", i)[0:3]
 
 
-def _get_name() -> str:
+def int4store(i: int) -> bytes:
     """
-    Generate a random uppercase string of fixed length for table names.
+    Takes an unsigned integer (4 bytes) and packs it as a bytes-object.
 
-    Returns:
-        Random string of length RANDOM_TABLE_NAME_LENGTH.
+    Returns string.
     """
-    char_set = string.ascii_uppercase
-    return "".join(random.choices(char_set, k=RANDOM_TABLE_NAME_LENGTH))
+    if i < 0 or i > 4294967295:
+        raise ValueError("int4store requires 0 <= i <= 4294967295")
+    return struct.pack("<I", i)
 
 
-def get_random_name(condition: Callable[[str], bool], max_calls: int = 100) -> str:
+def int8store(i: int) -> bytes:
     """
-    Generate a random string name that satisfies a given condition.
+    Takes an unsigned integer (8 bytes) and packs it as string.
 
-    Args:
-        condition: Callable that takes a generated name and returns True if it is valid.
-        max_calls: Maximum number of attempts before giving up (default 100).
-
-    Returns:
-        A random string that fulfills the provided condition.
-
-    Raises:
-        RuntimeError: If the maximum number of attempts is reached without success.
+    Returns string.
     """
-    for _ in range(max_calls):
-        if condition(name := _get_name()):
-            return name
-    # condition never met
-    raise RuntimeError("Reached max tries without successfully finding a unique name")
+    if i < 0 or i > 18446744073709551616:
+        raise ValueError("int8store requires 0 <= i <= 2^64")
+    return struct.pack("<Q", i)
 
 
-# Format conversions
-
-
-def format_value_sql(value: Any) -> Tuple[str, List[Any]]:
+def intstore(i: int) -> bytes:
     """
-    Convert a Python value into its SQL-compatible string representation and parameters.
+    Takes an unsigned integers and packs it as a bytes-object.
 
-    Args:
-        value: The value to format.
+    This function uses int1store, int2store, int3store,
+    int4store or int8store depending on the integer value.
 
-    Returns:
-        Tuple containing:
-            - A string for substitution into a SQL query.
-            - A list of parameters to be bound into the query.
+    returns string.
     """
-    if isinstance(value, (dict, list)):
-        if len(value) == 0:
-            return "%s", [None]
-        return "CAST(%s as JSON)", [json.dumps(value)]
-    return "%s", [value]
+    if i < 0 or i > 18446744073709551616:
+        raise ValueError("intstore requires 0 <= i <=  2^64")
+
+    if i <= 255:
+        formed_string = int1store
+    elif i <= 65535:
+        formed_string = int2store
+    elif i <= 16777215:
+        formed_string = int3store
+    elif i <= 4294967295:
+        formed_string = int4store
+    else:
+        formed_string = int8store
+
+    return formed_string(i)
 
 
-def sql_response_to_df(cursor: MySQLCursorAbstract) -> pd.DataFrame:
+def lc_int(i: int) -> bytes:
     """
-    Convert the results of a cursor's last executed query to a pandas DataFrame.
-
-    Args:
-        cursor: MySQLCursorAbstract with a completed query.
-
-    Returns:
-        DataFrame with data from the cursor.
-
-    Raises:
-        DatabaseError:
-            If a database connection issue occurs.
-            If an operational error occurs during execution.
-            If a compatible SELECT query wasn't the last statement ran
+    Takes an unsigned integer and packs it as bytes,
+    with the information of how much bytes the encoded int takes.
     """
+    if i < 0 or i > 18446744073709551616:
+        raise ValueError("Requires 0 <= i <= 2^64")
 
-    def _json_processor(elem: Optional[str]) -> Optional[dict]:
-        return json.loads(elem) if elem is not None else None
+    if i < 251:
+        return struct.pack("<B", i)
+    if i <= 65535:
+        return b"\xfc" + struct.pack("<H", i)
+    if i <= 16777215:
+        return b"\xfd" + struct.pack("<I", i)[0:3]
 
-    def _default_processor(elem: Any) -> Any:
-        return elem
+    return b"\xfe" + struct.pack("<Q", i)
 
-    idx_to_processor = {}
-    for idx, col in enumerate(cursor.description):
-        if col[1] == 245:
-            # 245 is the MySQL type code for JSON
-            idx_to_processor[idx] = _json_processor
+
+def read_bytes(buf: bytes, size: int) -> Tuple[bytes, bytes]:
+    """
+    Reads bytes from a buffer.
+
+    Returns a tuple with buffer less the read bytes, and the bytes.
+    """
+    res = buf[0:size]
+    return (buf[size:], res)
+
+
+def read_lc_string(buf: bytes) -> Tuple[bytes, Optional[bytes]]:
+    """
+    Takes a buffer and reads a length coded string from the start.
+
+    This is how Length coded strings work
+
+    If the string is 250 bytes long or smaller, then it looks like this:
+
+      <-- 1b  -->
+      +----------+-------------------------
+      |  length  | a string goes here
+      +----------+-------------------------
+
+    If the string is bigger than 250, then it looks like this:
+
+      <- 1b -><- 2/3/8 ->
+      +------+-----------+-------------------------
+      | type |  length   | a string goes here
+      +------+-----------+-------------------------
+
+      if type == \xfc:
+          length is code in next 2 bytes
+      elif type == \xfd:
+          length is code in next 3 bytes
+      elif type == \xfe:
+          length is code in next 8 bytes
+
+    NULL has a special value. If the buffer starts with \xfb then
+    it's a NULL and we return None as value.
+
+    Returns a tuple (trucated buffer, bytes).
+    """
+    if buf[0] == 251:  # \xfb
+        # NULL value
+        return (buf[1:], None)
+
+    length = lsize = 0
+    fst = buf[0]
+
+    if fst <= 250:  # \xFA
+        length = fst
+        return (buf[1 + length :], buf[1 : length + 1])
+    if fst == 252:
+        lsize = 2
+    elif fst == 253:
+        lsize = 3
+    elif fst == 254:
+        lsize = 8
+
+    length = intread(buf[1 : lsize + 1])
+    return (buf[lsize + length + 1 :], buf[lsize + 1 : length + lsize + 1])
+
+
+def read_lc_string_list(buf: bytes) -> Optional[Tuple[Optional[bytes], ...]]:
+    """Reads all length encoded strings from the given buffer
+
+    Returns a list of bytes
+    """
+    byteslst: List[Optional[bytes]] = []
+
+    sizes = {252: 2, 253: 3, 254: 8}
+
+    buf_len = len(buf)
+    pos = 0
+
+    while pos < buf_len:
+        first = buf[pos]
+        if first == 255:
+            # Special case when MySQL error 1317 is returned by MySQL.
+            # We simply return None.
+            return None
+        if first == 251:
+            # NULL value
+            byteslst.append(None)
+            pos += 1
         else:
-            idx_to_processor[idx] = _default_processor
-
-    rows = cursor.fetchall()
-
-    # Process results
-    processed_rows = []
-    for row in rows:
-        processed_row = list(row)
-
-        for idx, elem in enumerate(row):
-            processed_row[idx] = idx_to_processor[idx](elem)
-
-        processed_rows.append(processed_row)
-
-    return pd.DataFrame(processed_rows, columns=cursor.column_names)
-
-
-def sql_table_to_df(
-    cursor: MySQLCursorAbstract, schema_name: str, table_name: str
-) -> pd.DataFrame:
-    """
-    Load the entire contents of a SQL table into a pandas DataFrame.
-
-    Args:
-        cursor: MySQLCursorAbstract to execute the query.
-        schema_name: Name of the schema containing the table.
-        table_name: Name of the table to fetch.
-
-    Returns:
-        DataFrame containing all rows from the specified table.
-
-    Raises:
-        DatabaseError:
-            If the table does not exist
-            If a database connection issue occurs.
-            If an operational error occurs during execution.
-        ValueError: If the schema or table name is not valid
-    """
-    validate_name(schema_name)
-    validate_name(table_name)
-
-    execute_sql(cursor, f"SELECT * FROM {schema_name}.{table_name}")
-    return sql_response_to_df(cursor)
-
-
-# Table operations
-
-
-def table_exists(
-    cursor: MySQLCursorAbstract, schema_name: str, table_name: str
-) -> bool:
-    """
-    Check whether a table exists in a specific schema.
-
-    Args:
-        cursor: MySQLCursorAbstract object to execute the query.
-        schema_name: Name of the database schema.
-        table_name: Name of the table.
-
-    Returns:
-        True if the table exists, False otherwise.
-
-    Raises:
-        DatabaseError:
-            If a database connection issue occurs.
-            If an operational error occurs during execution.
-        ValueError: If the schema or table name is not valid
-    """
-    validate_name(schema_name)
-    validate_name(table_name)
-
-    cursor.execute(
-        """
-        SELECT 1
-        FROM information_schema.tables
-        WHERE table_schema = %s AND table_name = %s
-        LIMIT 1
-        """,
-        (schema_name, table_name),
-    )
-    return cursor.fetchone() is not None
-
-
-def delete_sql_table(
-    cursor: MySQLCursorAbstract, schema_name: str, table_name: str
-) -> None:
-    """
-    Drop a table from the SQL database if it exists.
-
-    Args:
-        cursor: MySQLCursorAbstract to execute the drop command.
-        schema_name: Name of the schema.
-        table_name: Name of the table to delete.
-
-    Returns:
-        None
-
-    Raises:
-        DatabaseError:
-            If a database connection issue occurs.
-            If an operational error occurs during execution.
-        ValueError: If the schema or table name is not valid
-    """
-    validate_name(schema_name)
-    validate_name(table_name)
-
-    execute_sql(cursor, f"DROP TABLE IF EXISTS {schema_name}.{table_name}")
-
-
-def extend_sql_table(
-    cursor: MySQLCursorAbstract,
-    schema_name: str,
-    table_name: str,
-    df: pd.DataFrame,
-    col_name_to_placeholder_string: Dict[str, str] = None,
-) -> None:
-    """
-    Insert all rows from a pandas DataFrame into an existing SQL table.
-
-    Args:
-        cursor: MySQLCursorAbstract for execution.
-        schema_name: Name of the database schema.
-        table_name: Table to insert new rows into.
-        df: DataFrame containing the rows to insert.
-        col_name_to_placeholder_string:
-            Optional mapping of column names to custom SQL value/placeholder
-            strings.
-
-    Returns:
-        None
-
-    Raises:
-        DatabaseError:
-            If the rows could not be inserted into the table, e.g., a type or shape issue
-            If a database connection issue occurs.
-            If an operational error occurs during execution.
-        ValueError: If the schema or table name is not valid
-    """
-    if col_name_to_placeholder_string is None:
-        col_name_to_placeholder_string = {}
-
-    validate_name(schema_name)
-    validate_name(table_name)
-    for col in df.columns:
-        validate_name(str(col))
-
-    qualified_table_name = f"{schema_name}.{table_name}"
-
-    # Iterate over all rows in the DataFrame to build insert statements row by row
-    for row in df.values:
-        placeholders, params = [], []
-        for elem, col in zip(row, df.columns):
-            elem = elem.item() if hasattr(elem, "item") else elem
-
-            if col in col_name_to_placeholder_string:
-                elem_placeholder, elem_params = col_name_to_placeholder_string[col], [
-                    str(elem)
-                ]
+            if first <= 250:
+                length = first
+                byteslst.append(buf[(pos + 1) : length + (pos + 1)])
+                pos += 1 + length
             else:
-                elem_placeholder, elem_params = format_value_sql(elem)
+                lsize = 0
+                try:
+                    lsize = sizes[first]
+                except KeyError:
+                    return None
+                length = intread(buf[(pos + 1) : lsize + (pos + 1)])
+                byteslst.append(buf[pos + 1 + lsize : length + lsize + (pos + 1)])
+                pos += 1 + lsize + length
 
-            placeholders.append(elem_placeholder)
-            params.extend(elem_params)
-
-        cols_sql = ", ".join([str(col) for col in df.columns])
-        placeholders_sql = ", ".join(placeholders)
-        insert_sql = (
-            f"INSERT INTO {qualified_table_name} "
-            f"({cols_sql}) VALUES ({placeholders_sql})"
-        )
-        execute_sql(cursor, insert_sql, params=params)
+    return tuple(byteslst)
 
 
-def sql_table_from_df(
-    cursor: MySQLCursorAbstract, schema_name: str, df: pd.DataFrame
-) -> Tuple[str, str]:
+def read_string(
+    buf: bytes,
+    end: Optional[bytes] = None,
+    size: Optional[int] = None,
+) -> Tuple[bytes, bytes]:
     """
-    Create a new SQL table with a random name, and populate it with data from a DataFrame.
+    Reads a string up until a character or for a given size.
 
-    If an 'id' column is defined in the dataframe, it will be used as the primary key.
+    Returns a tuple (trucated buffer, string).
+    """
+    if end is None and size is None:
+        raise ValueError("read_string() needs either end or size")
 
-    Args:
-        cursor: MySQLCursorAbstract for executing SQL.
-        schema_name: Schema in which to create the table.
-        df: DataFrame containing the data to be inserted.
+    if end is not None:
+        try:
+            idx = buf.index(end)
+        except ValueError as err:
+            raise ValueError("end byte not present in buffer") from err
+        return (buf[idx + 1 :], buf[0:idx])
+    if size is not None:
+        return read_bytes(buf, size)
+
+    raise ValueError("read_string() needs either end or size (weird)")
+
+
+def read_int(buf: bytes, size: int) -> Tuple[bytes, int]:
+    """Read an integer from buffer
+
+    Returns a tuple (truncated buffer, int)
+    """
+    res = intread(buf[0:size])
+    return (buf[size:], res)
+
+
+def read_lc_int(buf: bytes) -> Tuple[bytes, Optional[int]]:
+    """
+    Takes a buffer and reads an length code string from the start.
+
+    Returns a tuple with buffer less the integer and the integer read.
+    """
+    if not buf:
+        raise ValueError("Empty buffer.")
+
+    lcbyte = buf[0]
+    if lcbyte == 251:
+        return (buf[1:], None)
+    if lcbyte < 251:
+        return (buf[1:], int(lcbyte))
+    if lcbyte == 252:
+        return (buf[3:], struct.unpack("<xH", buf[0:3])[0])
+    if lcbyte == 253:
+        return (buf[4:], struct.unpack("<I", buf[1:4] + b"\x00")[0])
+    if lcbyte == 254:
+        return (buf[9:], struct.unpack("<xQ", buf[0:9])[0])
+    raise ValueError("Failed reading length encoded integer")
+
+
+#
+# For debugging
+#
+def _digest_buffer(buf: StrOrBytes) -> str:
+    """Debug function for showing buffers"""
+    if not isinstance(buf, str):
+        return "".join([f"\\x{c:02x}" for c in buf])
+    return "".join([f"\\x{ord(c):02x}" for c in buf])
+
+
+def print_buffer(
+    abuffer: StrOrBytes, prefix: Optional[str] = None, limit: int = 30
+) -> None:
+    """Debug function printing output of _digest_buffer()"""
+    if prefix:
+        if limit and limit > 0:
+            digest = _digest_buffer(abuffer[0:limit])
+        else:
+            digest = _digest_buffer(abuffer)
+        print(prefix + ": " + digest)
+    else:
+        print(_digest_buffer(abuffer))
+
+
+def _parse_os_release() -> Dict[str, str]:
+    """Parse the contents of /etc/os-release file.
 
     Returns:
-        Tuple (qualified_table_name, table_name): The schema-qualified and
-        unqualified table names.
-
-    Raises:
-        RuntimeError: If a random available table name could not be found.
-        ValueError: If any schema, table, or a column name is invalid.
-        DatabaseError:
-            If a database connection issue occurs.
-            If an operational error occurs during execution.
+        A dictionary containing release information.
     """
-    table_name = get_random_name(
-        lambda table_name: not table_exists(cursor, schema_name, table_name)
-    )
-    qualified_table_name = f"{schema_name}.{table_name}"
+    distro: Dict[str, str] = {}
+    os_release_file = os.path.join("/etc", "os-release")
+    if not os.path.exists(os_release_file):
+        return distro
+    with open(os_release_file, encoding="utf-8") as file_obj:
+        for line in file_obj:
+            key_value = line.split("=")
+            if len(key_value) != 2:
+                continue
+            key = key_value[0].lower()
+            value = key_value[1].rstrip("\n").strip('"')
+            distro[key] = value
+    return distro
 
-    validate_name(schema_name)
-    validate_name(table_name)
-    for col in df.columns:
-        validate_name(str(col))
 
-    columns_sql = []
-    for col, dtype in df.dtypes.items():
-        # Map pandas dtype to SQL type, fallback is VARCHAR
-        sql_type = PD_TO_SQL_DTYPE_MAPPING.get(str(dtype), "LONGTEXT")
-        validate_name(str(col))
-        columns_sql.append(f"{col} {sql_type}")
+def _parse_lsb_release() -> Dict[str, str]:
+    """Parse the contents of /etc/lsb-release file.
 
-    columns_str = ", ".join(columns_sql)
+    Returns:
+        A dictionary containing release information.
+    """
+    distro = {}
+    lsb_release_file = os.path.join("/etc", "lsb-release")
+    if os.path.exists(lsb_release_file):
+        with open(lsb_release_file, encoding="utf-8") as file_obj:
+            for line in file_obj:
+                key_value = line.split("=")
+                if len(key_value) != 2:
+                    continue
+                key = key_value[0].lower()
+                value = key_value[1].rstrip("\n").strip('"')
+                distro[key] = value
+    return distro
 
-    has_id_col = any(col.lower() == "id" for col in df.columns)
-    if has_id_col:
-        columns_str += ", PRIMARY KEY (id)"
 
-    # Create table with generated columns
-    create_table_sql = f"CREATE TABLE {qualified_table_name} ({columns_str})"
-    execute_sql(cursor, create_table_sql)
+def _parse_lsb_release_command() -> Optional[Dict[str, str]]:
+    """Parse the output of the lsb_release command.
+
+    Returns:
+        A dictionary containing release information.
+    """
+    distro = {}
+    with open(os.devnull, "w", encoding="utf-8") as devnull:
+        try:
+            stdout = subprocess.check_output(("lsb_release", "-a"), stderr=devnull)
+        except OSError:
+            return None
+        lines = stdout.decode(sys.getfilesystemencoding()).splitlines()
+        for line in lines:
+            key_value = line.split(":")
+            if len(key_value) != 2:
+                continue
+            key = key_value[0].replace(" ", "_").lower()
+            value = key_value[1].strip("\t")
+            distro[key] = value
+    return distro
+
+
+def linux_distribution() -> Tuple[str, str, str]:
+    """Tries to determine the name of the Linux OS distribution name.
+
+    First tries to get information from ``/etc/os-release`` file.
+    If fails, tries to get the information of ``/etc/lsb-release`` file.
+    And finally the information of ``lsb-release`` command.
+
+    Returns:
+        A tuple with (`name`, `version`, `codename`)
+    """
+    distro: Optional[Dict[str, str]] = _parse_lsb_release()
+    if distro:
+        return (
+            distro.get("distrib_id", ""),
+            distro.get("distrib_release", ""),
+            distro.get("distrib_codename", ""),
+        )
+
+    distro = _parse_lsb_release_command()
+    if distro:
+        return (
+            distro.get("distributor_id", ""),
+            distro.get("release", ""),
+            distro.get("codename", ""),
+        )
+
+    distro = _parse_os_release()
+    if distro:
+        return (
+            distro.get("name", ""),
+            distro.get("version_id", ""),
+            distro.get("version_codename", ""),
+        )
+
+    return ("", "", "")
+
+
+def _get_unicode_read_direction(unicode_str: str) -> str:
+    """Get the readiness direction of the unicode string.
+
+    We assume that the direction is "L-to-R" if the first character does not
+    indicate the direction is "R-to-L" or an "AL" (Arabic Letter).
+    """
+    if unicode_str and unicodedata.bidirectional(unicode_str[0]) in (
+        "R",
+        "AL",
+    ):
+        return "R-to-L"
+    return "L-to-R"
+
+
+def _get_unicode_direction_rule(unicode_str: str) -> Dict[str, Callable[[str], bool]]:
+    """
+    1) The characters in section 5.8 MUST be prohibited.
+
+    2) If a string contains any RandALCat character, the string MUST NOT
+       contain any LCat character.
+
+    3) If a string contains any RandALCat character, a RandALCat
+       character MUST be the first character of the string, and a
+       RandALCat character MUST be the last character of the string.
+    """
+    read_dir = _get_unicode_read_direction(unicode_str)
+
+    # point 3)
+    if read_dir == "R-to-L":
+        if not (in_table_d1(unicode_str[0]) and in_table_d1(unicode_str[-1])):
+            raise ValueError(
+                "Invalid unicode Bidirectional sequence, if the "
+                "first character is RandALCat, the final character"
+                "must be RandALCat too."
+            )
+        # characters from in_table_d2 are prohibited.
+        return {"Bidirectional Characters requirement 2 [StringPrep, d2]": in_table_d2}
+
+    # characters from in_table_d1 are prohibited.
+    return {"Bidirectional Characters requirement 2 [StringPrep, d2]": in_table_d1}
+
+
+def validate_normalized_unicode_string(
+    normalized_str: str,
+) -> Optional[Tuple[str, str]]:
+    """Check for Prohibited Output according to rfc4013 profile.
+
+    This profile specifies the following characters as prohibited input:
+
+       - Non-ASCII space characters [StringPrep, C.1.2]
+       - ASCII control characters [StringPrep, C.2.1]
+       - Non-ASCII control characters [StringPrep, C.2.2]
+       - Private Use characters [StringPrep, C.3]
+       - Non-character code points [StringPrep, C.4]
+       - Surrogate code points [StringPrep, C.5]
+       - Inappropriate for plain text characters [StringPrep, C.6]
+       - Inappropriate for canonical representation characters [StringPrep, C.7]
+       - Change display properties or deprecated characters [StringPrep, C.8]
+       - Tagging characters [StringPrep, C.9]
+
+    In addition of checking of Bidirectional Characters [StringPrep, Section 6]
+    and the Unassigned Code Points [StringPrep, A.1].
+
+    Returns:
+        A tuple with ("probited character", "breaked_rule")
+    """
+    rules = {
+        "Space characters that contains the ASCII code points": in_table_c11,
+        "Space characters non-ASCII code points": in_table_c12,
+        "Unassigned Code Points [StringPrep, A.1]": in_table_a1,
+        "Non-ASCII space characters [StringPrep, C.1.2]": in_table_c12,
+        "ASCII control characters [StringPrep, C.2.1]": in_table_c21_c22,
+        "Private Use characters [StringPrep, C.3]": in_table_c3,
+        "Non-character code points [StringPrep, C.4]": in_table_c4,
+        "Surrogate code points [StringPrep, C.5]": in_table_c5,
+        "Inappropriate for plain text characters [StringPrep, C.6]": in_table_c6,
+        "Inappropriate for canonical representation characters [StringPrep, C.7]": in_table_c7,
+        "Change display properties or deprecated characters [StringPrep, C.8]": in_table_c8,
+        "Tagging characters [StringPrep, C.9]": in_table_c9,
+    }
 
     try:
-        # Insert provided data into new table
-        extend_sql_table(cursor, schema_name, table_name, df)
-    except Exception:  # pylint: disable=broad-exception-caught
-        # Delete table before we lose access to it
-        delete_sql_table(cursor, schema_name, table_name)
-        raise
-    return qualified_table_name, table_name
+        rules.update(_get_unicode_direction_rule(normalized_str))
+    except ValueError as err:
+        return normalized_str, str(err)
+
+    for char in normalized_str:
+        for rule, func in rules.items():
+            if func(char) and char != " ":
+                return char, rule
+
+    return None
 
 
-def validate_name(name: str) -> str:
-    """
-    Validate that the string is a legal SQL identifier (letters, digits, underscores).
+def normalize_unicode_string(a_string: str) -> str:
+    """normalizes a unicode string according to rfc4013
 
-    Args:
-        name: Name (schema, table, or column) to validate.
+    Normalization of a unicode string according to rfc4013: The SASLprep profile
+    of the "stringprep" algorithm.
+
+    Normalization Unicode equivalence is the specification by the Unicode
+    character encoding standard that some sequences of code points represent
+    essentially the same character.
+
+    This method normalizes using the Normalization Form Compatibility
+    Composition (NFKC), as described in rfc4013 2.2.
 
     Returns:
-        The validated name.
+        Normalized unicode string according to rfc4013.
+    """
+    # Per rfc4013 2.1. Mapping
+    # non-ASCII space characters [StringPrep, C.1.2] are mapped to ' ' (U+0020)
+    # "commonly mapped to nothing" characters [StringPrep, B.1] are mapped to ''
+    nstr_list = [
+        " " if in_table_c12(char) else "" if in_table_b1(char) else char
+        for char in a_string
+    ]
+
+    nstr = "".join(nstr_list)
+
+    # Per rfc4013 2.2. Use NFKC Normalization Form Compatibility Composition
+    # Characters are decomposed by compatibility, then recomposed by canonical
+    # equivalence.
+    nstr = unicodedata.normalize("NFKC", nstr)
+    if not nstr:
+        # Normilization results in empty string.
+        return ""
+
+    return nstr
+
+
+def init_bytearray(
+    payload: Union[int, StrOrBytes] = b"", encoding: str = "utf-8"
+) -> bytearray:
+    """Initialize a bytearray from the payload."""
+    if isinstance(payload, bytearray):
+        return payload
+    if isinstance(payload, int):
+        return bytearray(payload)
+    if not isinstance(payload, bytes):
+        try:
+            return bytearray(payload.encode(encoding=encoding))
+        except AttributeError as err:
+            raise ValueError("payload must be a str or bytes") from err
+
+    return bytearray(payload)
+
+
+@lru_cache()
+def get_platform() -> Dict[str, Union[str, Tuple[str, str]]]:
+    """Return a dict with the platform arch and OS version."""
+    plat: Dict[str, Union[str, Tuple[str, str]]] = {"arch": "", "version": ""}
+    if os.name == "nt":
+        if "64" in platform.architecture()[0]:
+            plat["arch"] = "x86_64"
+        elif "32" in platform.architecture()[0]:
+            plat["arch"] = "i386"
+        else:
+            plat["arch"] = platform.architecture()
+        plat["version"] = f"Windows-{platform.win32_ver()[1]}"
+    else:
+        plat["arch"] = platform.machine()
+        if platform.system() == "Darwin":
+            plat["version"] = f"macOS-{platform.mac_ver()[0]}"
+        else:
+            plat["version"] = "-".join(linux_distribution()[0:2])
+
+    return plat
+
+
+def import_object(fullpath: str) -> Any:
+    """Import an object from a fully qualified module path.
+
+    Args:
+        obj (str): A string representing the fully qualified name of the object.
+
+    Returns:
+        Object: The imported object.
 
     Raises:
-        ValueError: If the name does not meet format requirements.
+        ValueError: If the object can't be imported.
+
+    .. versionadded:: 8.0.33
     """
-    # Accepts only letters, digits, and underscores; change as needed
-    if not (isinstance(name, str) and re.match(r"^[A-Za-z0-9_]+$", name)):
-        raise ValueError(f"Unsupported name format {name}")
+    if not isinstance(fullpath, str):
+        raise ValueError(
+            "'fullpath' should be a str representing the fully qualified name of the "
+            "object to be imported"
+        )
+    try:
+        module_str, callable_str = fullpath.rsplit(".", 1)
+        module = importlib.import_module(module_str)
+        obj = getattr(module, callable_str)
+    except ValueError:
+        raise ValueError(f"No callable named '{fullpath}'") from None
+    except (AttributeError, ModuleNotFoundError) as err:
+        raise ValueError(f"{err}") from err
 
-    return name
+    return obj
 
 
-def source_schema(db_connection: MySQLConnectionAbstract) -> str:
-    """
-    Retrieve the name of the currently selected schema, or set and ensure the default schema.
+def warn_ciphersuites_deprecated(cipher_as_ossl: str, tls_version: str) -> None:
+    """Emits a warning if a deprecated cipher is being utilized.
 
     Args:
-        db_connection: MySQL connector database connection object.
-
-    Returns:
-        Name of the schema (database in use).
+        cipher: Must be ingested as OpenSSL name.
+        tls_versions: TLS version to check the cipher against.
 
     Raises:
-        ValueError: If the schema name is not valid
-        DatabaseError:
-            If a database connection issue occurs.
-            If an operational error occurs during execution.
+        DeprecationWarning: If the cipher is flagged as deprecated
+                            according to the OSSA cipher list.
     """
-    schema = db_connection.database
-    if schema is None:
-        schema = DEFAULT_SCHEMA
-
-        with atomic_transaction(db_connection) as cursor:
-            create_database_stmt = f"CREATE DATABASE IF NOT EXISTS {schema}"
-            execute_sql(cursor, create_database_stmt)
-
-    validate_name(schema)
-
-    return schema
+    if cipher_as_ossl in DEPRECATED_TLS_CIPHERSUITES.get(tls_version, {}).values():
+        warn_msg = (
+            f"This connection is using TLS cipher {cipher_as_ossl} which is now "
+            "deprecated and will be removed in a future release of "
+            "MySQL Connector/Python."
+        )
+        warnings.warn(warn_msg, DeprecationWarning)
 
 
-def is_table_empty(
-    cursor: MySQLCursorAbstract, schema_name: str, table_name: str
-) -> bool:
-    """
-    Determine if a given SQL table is empty.
+def warn_tls_version_deprecated(tls_version: str) -> None:
+    """Emits a warning if a deprecated TLS version is being utilized.
 
     Args:
-        cursor: MySQLCursorAbstract with access to the database.
-        schema_name: Name of the schema containing the table.
-        table_name: Name of the table to check.
-
-    Returns:
-        True if the table has no rows, False otherwise.
+        tls_versions: TLS version to check.
 
     Raises:
-        DatabaseError:
-            If the table does not exist
-            If a database connection issue occurs.
-            If an operational error occurs during execution.
-        ValueError: If the schema or table name is not valid
+        DeprecationWarning: If the TLS version is flagged as deprecated
+                            according to the OSSA cipher list.
     """
-    validate_name(schema_name)
-    validate_name(table_name)
+    if tls_version in DEPRECATED_TLS_VERSIONS:
+        warn_msg = (
+            f"This connection is using TLS version {tls_version} which is now "
+            "deprecated and will be removed in a future release of "
+            "MySQL Connector/Python."
+        )
+        warnings.warn(warn_msg, DeprecationWarning)
 
-    cursor.execute(f"SELECT 1 FROM {schema_name}.{table_name} LIMIT 1")
-    return cursor.fetchone() is None
 
+class GenericWrapper:
+    """Base class that provides basic object wrapper functionality."""
 
-def convert_to_df(
-    arr: Optional[Union[pd.DataFrame, pd.Series, np.ndarray]],
-    col_prefix: str = "feature",
-) -> Optional[pd.DataFrame]:
-    """
-    Convert input data to a pandas DataFrame if necessary.
+    def __init__(self, wrapped: Any) -> None:
+        """Constructor."""
+        self._wrapped: Any = wrapped
 
-    Args:
-        arr: Input data as a pandas DataFrame, NumPy ndarray, pandas Series, or None.
+    def __getattr__(self, attr: str) -> Any:
+        """Gets an attribute.
 
-    Returns:
-        If the input is None, returns None.
-        Otherwise, returns a DataFrame backed by the same underlying data whenever
-        possible (except in cases where pandas or NumPy must copy, such as for
-        certain views or non-contiguous arrays).
+        Attributes defined in the wrapper object have higher precedence
+        than those wrapped object equivalent. Attributes not found in
+        the wrapper are then searched in the wrapped object.
+        """
+        if attr in self.__dict__:
+            # this object has it
+            return getattr(self, attr)
+        # proxy to the wrapped object
+        return getattr(self._wrapped, attr)
 
-    Notes:
-        - If an ndarray is passed, column names will be integer indices (0, 1, ...).
-        - If a DataFrame is passed, column names and indices are preserved.
-        - The returned DataFrame is a shallow copy and shares data with the original
-          input when possible; however, copies may still occur for certain input
-          types or memory layouts.
-    """
-    if arr is None:
-        return None
+    def __setattr__(self, name: str, value: Any) -> None:
+        """Sets an attribute."""
+        if "_wrapped" not in self.__dict__:
+            self.__dict__["_wrapped"] = value
+            return
 
-    if isinstance(arr, pd.DataFrame):
-        return pd.DataFrame(arr)
-    if isinstance(arr, pd.Series):
-        return arr.to_frame()
+        if name in self.__dict__:
+            # this object has it
+            super().__setattr__(name, value)
+            return
+        # proxy to the wrapped object
+        self._wrapped.__setattr__(name, value)
 
-    if arr.ndim == 1:
-        arr = arr.reshape(-1, 1)
-    col_names = [f"{col_prefix}_{idx}" for idx in range(arr.shape[1])]
-
-    return pd.DataFrame(arr, columns=col_names, copy=False)
+    def get_wrapped_class(self) -> str:
+        """Gets the wrapped class name."""
+        return self._wrapped.__class__.__name__
