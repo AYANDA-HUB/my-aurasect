@@ -1,0 +1,36 @@
+# FastAPI and ASGI server
+fastapi==0.111.0
+uvicorn[standard]==0.23.2
+
+# Database and ORM
+sqlalchemy==2.0.20
+pymysql==1.1.1
+alembic==1.24.0
+python-dotenv==1.0.1
+
+# Password hashing
+passlib[bcrypt]==1.7.5
+
+# Pydantic for schemas
+pydantic==2.5.2
+
+# File handling
+PyPDF2==3.0.1
+python-docx==0.8.12
+openpyxl==3.2.3
+python-multipart==0.0.6
+aiofiles==23.1.0
+
+# Chatbot / NLP
+transformers==4.40.2
+torch==2.1.0
+sentence-transformers==2.2.2
+langdetect==1.0.9
+
+# Voice / TTS / STT
+gTTS==2.3.3
+SpeechRecognition==3.9.0
+pydub==0.25.1
+
+# Utilities
+requests==2.32.1
